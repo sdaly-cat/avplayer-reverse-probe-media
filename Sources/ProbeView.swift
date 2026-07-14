@@ -57,6 +57,7 @@ struct ProbeView: View {
         .onAppear {
             probeLog.log("probe launched — remoteURL=\(remoteURL.absoluteString, privacy: .public)")
             forceLandscape()
+            probeConnectivity()
             installTimeObserver()
             loadRemote()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { logOrientation() }
@@ -69,7 +70,15 @@ struct ProbeView: View {
     }
 
     func loadRemote() {
-        let asset = AVURLAsset(url: remoteURL)
+        // GitHub Releases redirects to objects.githubusercontent.com, which serves the file as
+        // `application/octet-stream` with no `.mp4` in the redirected path — so AVFoundation can't
+        // identify the container and fails with AVErrorFileFormatNotRecognized (-11828). Override the
+        // MIME type so it treats the stream as MP4. (iOS 17+; harmless no-op below that.)
+        var options: [String: Any] = [:]
+        if #available(iOS 17.0, *) {
+            options[AVURLAssetOverrideMIMETypeKey] = "video/mp4"
+        }
+        let asset = AVURLAsset(url: remoteURL, options: options)
         let item = AVPlayerItem(asset: asset)
         player.replaceCurrentItem(with: item)
         status = "loading remote (stream)…"
@@ -103,7 +112,8 @@ struct ProbeView: View {
                 probeLog.log("\(label, privacy: .public) ready — canPlayReverse=\(item.canPlayReverse, privacy: .public) slow=\(item.canPlaySlowReverse, privacy: .public) fast=\(item.canPlayFastReverse, privacy: .public)")
             } else if item.status == .failed {
                 reverseFlags = "[\(label)] item FAILED: \(item.error?.localizedDescription ?? "?")"
-                probeLog.error("\(label, privacy: .public) item FAILED: \(item.error?.localizedDescription ?? "?", privacy: .public)")
+                probeLog.error("\(label, privacy: .public) item FAILED: \(describeError(item.error), privacy: .public)")
+                logMediaLogs(item, label: label)
             } else {
                 pollReady(item, label: label)
             }
@@ -119,6 +129,53 @@ struct ProbeView: View {
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape)) { error in
             probeLog.error("requestGeometryUpdate failed: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// Unpack an NSError deeply (domain, code, and nested underlying errors) — AVFoundation's
+    /// top-level `localizedDescription` ("Cannot Open") hides the real cause in the underlying error.
+    func describeError(_ error: Error?) -> String {
+        guard var err = error as NSError? else { return "nil" }
+        var parts: [String] = []
+        while true {
+            parts.append("\(err.domain)#\(err.code): \(err.localizedDescription)")
+            guard let underlying = err.userInfo[NSUnderlyingErrorKey] as? NSError else { break }
+            err = underlying
+        }
+        return parts.joined(separator: " ⟶ ")
+    }
+
+    /// Dump AVPlayerItem's HTTP-level error/access logs — these reveal whether the network fetch
+    /// itself failed (HTTP status, bytes transferred, server) vs the media being unparseable.
+    func logMediaLogs(_ item: AVPlayerItem, label: String) {
+        if let el = item.errorLog(), !el.events.isEmpty {
+            for e in el.events {
+                probeLog.error("[\(label, privacy: .public)] errorLog status=\(e.errorStatusCode, privacy: .public) domain=\(e.errorDomain, privacy: .public) server=\(e.serverAddress ?? "-", privacy: .public) uri=\(e.uri ?? "-", privacy: .public) comment=\(e.errorComment ?? "-", privacy: .public)")
+            }
+        } else {
+            probeLog.error("[\(label, privacy: .public)] errorLog: (empty — failure happened before/without an HTTP transaction)")
+        }
+        if let al = item.accessLog(), !al.events.isEmpty {
+            for e in al.events {
+                probeLog.log("[\(label, privacy: .public)] accessLog server=\(e.serverAddress ?? "-", privacy: .public) bytes=\(e.numberOfBytesTransferred, privacy: .public) uri=\(e.uri ?? "-", privacy: .public)")
+            }
+        } else {
+            probeLog.log("[\(label, privacy: .public)] accessLog: (empty — no bytes ever transferred)")
+        }
+    }
+
+    /// Independent network check: fetch the first 64 KB of the SAME url via URLSession. Isolates
+    /// "can the Simulator reach the media at all" from "does AVFoundation accept the asset".
+    func probeConnectivity() {
+        var req = URLRequest(url: remoteURL)
+        req.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            if let err = err as NSError? {
+                probeLog.error("connectivity: FAILED \(err.domain, privacy: .public)#\(err.code, privacy: .public): \(err.localizedDescription, privacy: .public)")
+                return
+            }
+            let http = resp as? HTTPURLResponse
+            probeLog.log("connectivity: status=\(http?.statusCode ?? -1, privacy: .public) type=\(http?.value(forHTTPHeaderField: "Content-Type") ?? "-", privacy: .public) accept-ranges=\(http?.value(forHTTPHeaderField: "Accept-Ranges") ?? "-", privacy: .public) bytes=\(data?.count ?? 0, privacy: .public)")
+        }.resume()
     }
 
     func logOrientation() {
