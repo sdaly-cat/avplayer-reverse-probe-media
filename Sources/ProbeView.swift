@@ -1,6 +1,12 @@
 import SwiftUI
 import AVKit
 import AVFoundation
+import os
+
+/// Structured log channel for the probe. Filter it from the host with:
+///   xcrun simctl spawn booted log stream --predicate 'subsystem == "com.catapult.ReverseProbe"'
+/// Interpolations are marked `.public` so they are NOT redacted as `<private>`.
+let probeLog = Logger(subsystem: "com.catapult.ReverseProbe", category: "probe")
 
 /// Feasibility probe for native AVPlayer reverse playback while STREAMING over a CDN.
 /// See HANDOFF.md for the full "what is this / what question does it answer" brief.
@@ -23,7 +29,9 @@ struct ProbeView: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            VideoPlayer(player: player).frame(height: 320)
+            // Fill all vertical space left over by the compact control cluster below.
+            VideoPlayer(player: player)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             Text(status).font(.footnote)
             Text(reverseFlags).font(.footnote).foregroundColor(.secondary)
             Text(timeText).font(.system(.footnote, design: .monospaced))
@@ -39,7 +47,20 @@ struct ProbeView: View {
             }
         }
         .padding()
-        .onAppear { installTimeObserver(); loadRemote() }
+        .background(
+            GeometryReader { proxy in
+                Color.clear.onAppear {
+                    probeLog.log("layout: SwiftUI content size=\(Int(proxy.size.width), privacy: .public)x\(Int(proxy.size.height), privacy: .public)")
+                }
+            }
+        )
+        .onAppear {
+            probeLog.log("probe launched — remoteURL=\(remoteURL.absoluteString, privacy: .public)")
+            forceLandscape()
+            installTimeObserver()
+            loadRemote()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { logOrientation() }
+        }
     }
 
     func setRate(_ r: Float) {
@@ -79,12 +100,33 @@ struct ProbeView: View {
             if item.status == .readyToPlay {
                 reverseFlags = "[\(label)] canPlayReverse=\(item.canPlayReverse)  slow=\(item.canPlaySlowReverse)  fast=\(item.canPlayFastReverse)"
                 status = "\(label) ready — play forward, then try negative rates"
+                probeLog.log("\(label, privacy: .public) ready — canPlayReverse=\(item.canPlayReverse, privacy: .public) slow=\(item.canPlaySlowReverse, privacy: .public) fast=\(item.canPlayFastReverse, privacy: .public)")
             } else if item.status == .failed {
                 reverseFlags = "[\(label)] item FAILED: \(item.error?.localizedDescription ?? "?")"
+                probeLog.error("\(label, privacy: .public) item FAILED: \(item.error?.localizedDescription ?? "?", privacy: .public)")
             } else {
                 pollReady(item, label: label)
             }
         }
+    }
+
+    /// Explicitly ask the window scene to snap to landscape. The Info.plist already locks the app
+    /// to landscape, but the iOS Simulator sometimes fails to rotate a freshly-launched orientation-
+    /// locked app when the device is physically portrait — this forces it. No-op / harmless on a real
+    /// device (which honors the plist lock on its own).
+    func forceLandscape() {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape)) { error in
+            probeLog.error("requestGeometryUpdate failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    func logOrientation() {
+        let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+        let o = scene?.interfaceOrientation.rawValue ?? -1
+        let size = scene?.windows.first?.bounds.size ?? .zero
+        let isLandscape = scene?.interfaceOrientation.isLandscape ?? false
+        probeLog.log("orientation: interfaceOrientation=\(o, privacy: .public) isLandscape=\(isLandscape, privacy: .public) window=\(Int(size.width), privacy: .public)x\(Int(size.height), privacy: .public)")
     }
 
     func installTimeObserver() {
