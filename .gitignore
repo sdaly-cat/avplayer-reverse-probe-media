@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Swift Package Manager
+.build/
+
+# The .xcodeproj IS committed (so it's clone-and-open), but never its per-user state:
+ReverseProbe.xcodeproj/xcuserdata/
+ReverseProbe.xcodeproj/project.xcworkspace/xcuserdata/
