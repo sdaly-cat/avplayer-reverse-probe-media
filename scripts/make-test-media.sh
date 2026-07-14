@@ -50,6 +50,15 @@ BALL_C=$(( BALL_SIZE/2 ))                              # ball center
 SPEED_X=0.27            # horizontal bounce frequency (bigger = faster)
 SPEED_Y=0.37            # vertical bounce frequency (different from X so it wanders)
 GRID=128               # static reference-grid spacing (px)
+# Background decode-load knobs. The plain ball-on-flat-bg is ~98% skip macroblocks (near-free to
+# decode), so its 12 Mbps is mostly filler. Adding TEMPORAL noise to the background defeats skip
+# blocks so the bitrate becomes real, decode-meaningful residual — dialling the decoder's workload
+# toward realistic footage WITHOUT going all the way to pathological per-pixel white noise.
+#   NOISE_STRENGTH: 0 = off (old behaviour) … ~100 = full static. ~20-40 ≈ "busy footage".
+#   NOISE_SIGMA:    blur applied to the noise — softens fizz into coarser, texture-like grain that
+#                   is less eye-distracting and less pathological (closer to real content).
+NOISE_STRENGTH="${NOISE_STRENGTH:-60}"
+NOISE_SIGMA="${NOISE_SIGMA:-0.8}"
 ARROW_SIZE=150         # size of the direction-arrow glyph drawn inside the ball
 MAXX=$(( WIDTH - BALL_SIZE ))    # ball horizontal travel range (matches overlay's W-w)
 MAXY=$(( HEIGHT - BALL_SIZE ))   # ball vertical travel range   (matches overlay's H-h)
@@ -83,7 +92,9 @@ encode() {
   local ay="'${MAXY}*abs(mod(t*${SPEED_Y},2)-1)+${BALL_C}-text_h/2'"
   local aopts="fontfile=${ARROW_FONT}:fontsize=${ARROW_SIZE}:fontcolor=black:borderw=6:bordercolor=white@0.85:x=${ax}:y=${ay}"
 
-  local filter="[0:v]drawgrid=w=${GRID}:h=${GRID}:t=2:color=white@0.10[bg];\
+  # Background = grid, then temporal noise (defeats skip blocks so the bitrate is real decode work),
+  # then a light blur so the grain is coarse/texture-like rather than fizzy per-pixel static.
+  local filter="[0:v]drawgrid=w=${GRID}:h=${GRID}:t=2:color=white@0.10,noise=alls=${NOISE_STRENGTH}:allf=t+u,gblur=sigma=${NOISE_SIGMA}[bg];\
 [1:v]format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte((X-${BALL_C})*(X-${BALL_C})+(Y-${BALL_C})*(Y-${BALL_C}),${BALL_R2}),255,0)'[ball];\
 [bg][ball]overlay=x='(W-w)*abs(mod(t*${SPEED_X},2)-1)':y='(H-h)*abs(mod(t*${SPEED_Y},2)-1)':shortest=1[m];\
 [m]drawtext=${aopts}:text='↘':enable='gte(mod(t*${SPEED_X},2),1)*gte(mod(t*${SPEED_Y},2),1)'[ar1];\
