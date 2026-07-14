@@ -16,6 +16,11 @@ struct ProbeView: View {
     @State private var reverseFlags = "reverse flags: (waiting)"
     @State private var timeText = "t = 0.00"
     @State private var timeObserver: Any?
+    @State private var currentSeconds: Double = 0     // playhead, mirrored to the seek slider
+    @State private var durationSeconds: Double = 0     // item duration (0 until known)
+    @State private var isScrubbing = false             // true while dragging the slider
+    @State private var isSeekInProgress = false         // a scrub seek is mid-flight
+    @State private var pendingSeekTarget: Double? = nil // latest requested scrub position
 
     // MARK: - Test media (synthetic, hosted on this repo's GitHub Releases)
     // Both are 1920x1080, 59.94fps, H.264 High@4.2, progressive, GOP-30, 12 Mbps CBR, ~180s.
@@ -35,6 +40,18 @@ struct ProbeView: View {
             Text(status).font(.footnote)
             Text(reverseFlags).font(.footnote).foregroundColor(.secondary)
             Text(timeText).font(.system(.footnote, design: .monospaced))
+            // Seek slider — drag to scrub/seek to a position. `isScrubbing` stops the periodic
+            // time observer from fighting the drag; the seek is issued on release.
+            HStack(spacing: 10) {
+                Text(timeLabel(currentSeconds)).font(.system(.caption2, design: .monospaced))
+                SeekBar(
+                    current: currentSeconds,
+                    duration: durationSeconds,
+                    onScrub: { s in isScrubbing = true; currentSeconds = s; scrubSeek(to: s) },
+                    onCommit: { s in currentSeconds = s; isScrubbing = false; seek(to: s) }
+                )
+                Text(timeLabel(durationSeconds)).font(.system(.caption2, design: .monospaced))
+            }
             HStack {
                 ForEach([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0], id: \.self) { r in
                     Button(r == 0 ? "❚❚" : String(format: "%.1f", r)) { setRate(Float(r)) }
@@ -62,6 +79,7 @@ struct ProbeView: View {
             loadRemote()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { logOrientation() }
         }
+        .preferredColorScheme(.dark)   // black background; default (black) text flips to light so none of it vanishes
     }
 
     func setRate(_ r: Float) {
@@ -109,7 +127,9 @@ struct ProbeView: View {
             if item.status == .readyToPlay {
                 reverseFlags = "[\(label)] canPlayReverse=\(item.canPlayReverse)  slow=\(item.canPlaySlowReverse)  fast=\(item.canPlayFastReverse)"
                 status = "\(label) ready — play forward, then try negative rates"
-                probeLog.log("\(label, privacy: .public) ready — canPlayReverse=\(item.canPlayReverse, privacy: .public) slow=\(item.canPlaySlowReverse, privacy: .public) fast=\(item.canPlayFastReverse, privacy: .public)")
+                let d = CMTimeGetSeconds(item.duration)
+                if d.isFinite, d > 0 { durationSeconds = d }   // enable the seek slider immediately
+                probeLog.log("\(label, privacy: .public) ready — canPlayReverse=\(item.canPlayReverse, privacy: .public) slow=\(item.canPlaySlowReverse, privacy: .public) fast=\(item.canPlayFastReverse, privacy: .public) duration=\(d, privacy: .public)")
             } else if item.status == .failed {
                 reverseFlags = "[\(label)] item FAILED: \(item.error?.localizedDescription ?? "?")"
                 probeLog.error("\(label, privacy: .public) item FAILED: \(describeError(item.error), privacy: .public)")
@@ -187,9 +207,98 @@ struct ProbeView: View {
     }
 
     func installTimeObserver() {
-        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { t in
-            timeText = String(format: "t = %.2f", CMTimeGetSeconds(t))
+            let cur = CMTimeGetSeconds(t)
+            if cur.isFinite {
+                timeText = String(format: "t = %.2f", cur)
+                if !isScrubbing { currentSeconds = cur }   // don't fight an active drag
+            }
+            if let d = player.currentItem?.duration, d.isNumeric {
+                let ds = CMTimeGetSeconds(d)
+                if ds.isFinite, ds > 0 { durationSeconds = ds }
+            }
         }
+    }
+
+    /// Seek exactly (zero tolerance) so scrubbing lands on the intended frame — important for a
+    /// probe that judges reverse smoothness. Does not change `rate`. Used on drag RELEASE.
+    func seek(to seconds: Double) {
+        let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        probeLog.log("seek to \(seconds, privacy: .public)s")
+    }
+
+    /// Live scrub: update the frame continuously WHILE dragging. Uses the "seek chasing" pattern —
+    /// only one seek is in flight at a time; if newer positions arrive during a seek, the completion
+    /// handler chases the most recent one. A small tolerance keeps it responsive (matches how the
+    /// system scrubber previews during a drag); the exact landing happens via seek(to:) on release.
+    func scrubSeek(to seconds: Double) {
+        pendingSeekTarget = seconds
+        guard !isSeekInProgress else { return }
+        chaseSeek()
+    }
+
+    private func chaseSeek() {
+        guard let target = pendingSeekTarget else { isSeekInProgress = false; return }
+        pendingSeekTarget = nil
+        isSeekInProgress = true
+        let tol = CMTime(seconds: 0.25, preferredTimescale: 600)
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
+                    toleranceBefore: tol, toleranceAfter: tol) { _ in
+            chaseSeek()   // a newer target may have arrived mid-seek — chase it
+        }
+    }
+
+    func timeLabel(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "--:--" }
+        let s = Int(seconds.rounded(.down))
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+}
+
+/// A seek bar that seeks to wherever you TAP (not just when you grab the thumb) and also supports
+/// dragging. A stock SwiftUI `Slider` only moves when the thumb itself is dragged; a
+/// `DragGesture(minimumDistance: 0)` over the whole track treats a tap as a zero-length drag, so a
+/// single click jumps straight to that position.
+struct SeekBar: View {
+    let current: Double
+    let duration: Double
+    let onScrub: (Double) -> Void    // fired continuously while touching (updates the playhead state)
+    let onCommit: (Double) -> Void   // fired on release / tap-up (issues the actual seek)
+
+    private let trackHeight: CGFloat = 8
+    private let thumb: CGFloat = 20
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let frac = duration > 0 ? min(max(current / duration, 0), 1) : 0
+            let x = CGFloat(frac) * w
+            ZStack(alignment: .leading) {
+                // systemGray2 adapts to light/dark and is visible on the app's white background
+                // (a white/low-opacity track vanished against it).
+                Capsule().fill(Color(.systemGray2)).frame(height: trackHeight)
+                Capsule().fill(Color.accentColor).frame(width: x, height: trackHeight)
+                Circle().fill(Color.white).frame(width: thumb, height: thumb)
+                    .shadow(radius: 1)
+                    .offset(x: min(max(x - thumb / 2, 0), w - thumb))
+            }
+            .frame(height: thumb, alignment: .leading)
+            .frame(maxHeight: .infinity)            // center the track vertically in the row
+            .contentShape(Rectangle())               // whole area is tappable, not just the thumb
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        guard duration > 0, w > 0 else { return }
+                        onScrub(Double(min(max(v.location.x / w, 0), 1)) * duration)
+                    }
+                    .onEnded { v in
+                        guard duration > 0, w > 0 else { return }
+                        onCommit(Double(min(max(v.location.x / w, 0), 1)) * duration)
+                    }
+            )
+        }
+        .frame(height: 28)
     }
 }
