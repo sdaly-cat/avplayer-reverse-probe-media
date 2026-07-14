@@ -21,6 +21,8 @@ struct ProbeView: View {
     @State private var isScrubbing = false             // true while dragging the slider
     @State private var isSeekInProgress = false         // a scrub seek is mid-flight
     @State private var pendingSeekTarget: Double? = nil // latest requested scrub position
+    @State private var isPlaying = false                // drives the play/pause toggle icon
+    @State private var clipIndex = 0                    // which entry of `clips` is loaded
 
     // MARK: - Test media (synthetic, hosted on this repo's GitHub Releases)
     // Both are 1920x1080, 59.94fps, H.264 High@4.2, progressive, GOP-30, 12 Mbps CBR, ~180s.
@@ -28,9 +30,13 @@ struct ProbeView: View {
     static let closedGOP = URL(string: "https://github.com/sdaly-cat/avplayer-reverse-probe-media/releases/download/v1/synthetic_ball_1080p_5994fps_3min_closedgop.mp4")!
     static let openGOP   = URL(string: "https://github.com/sdaly-cat/avplayer-reverse-probe-media/releases/download/v1/synthetic_ball_1080p_5994fps_3min_opengop.mp4")!
 
-    // Flip this between .closedGOP and .openGOP to compare. (Open GOP is the harder, more
-    // representative case — it's what tripped up WebCodecs on the web player.)
-    private let remoteURL = ProbeView.closedGOP
+    // Available clips — pick from the on-screen "Stream" menu. Add entries here and they show up in
+    // the menu automatically. (Open GOP is the harder, more representative case.)
+    static let clips: [(name: String, url: URL)] = [
+        ("Closed GOP", closedGOP),
+        ("Open GOP",   openGOP),
+    ]
+    private var remoteURL: URL { Self.clips[clipIndex].url }
 
     var body: some View {
         VStack(spacing: 10) {
@@ -54,12 +60,29 @@ struct ProbeView: View {
             }
             HStack {
                 ForEach([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0], id: \.self) { r in
-                    Button(r == 0 ? "❚❚" : String(format: "%.1f", r)) { setRate(Float(r)) }
+                    if r == 0 {
+                        // Real play/pause toggle: pause from any rate, resume at 1× when paused.
+                        Button {
+                            togglePlayPause()
+                        } label: {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        }
                         .buttonStyle(.bordered)
+                    } else {
+                        Button(String(format: "%.1f", r)) { setRate(Float(r)) }
+                            .buttonStyle(.bordered)
+                    }
                 }
             }
             HStack(spacing: 12) {
-                Button("Load remote (stream)") { loadRemote() }.buttonStyle(.borderedProminent)
+                Menu {
+                    ForEach(Array(Self.clips.enumerated()), id: \.offset) { idx, clip in
+                        Button(clip.name) { clipIndex = idx; loadRemote() }
+                    }
+                } label: {
+                    Label("Stream: \(Self.clips[clipIndex].name)", systemImage: "chevron.down.circle")
+                }
+                .buttonStyle(.borderedProminent)
                 Button("Download then play local") { downloadThenPlay() }.buttonStyle(.bordered)
             }
         }
@@ -84,7 +107,14 @@ struct ProbeView: View {
 
     func setRate(_ r: Float) {
         player.rate = r            // negative = reverse (requires item.canPlayReverse)
+        isPlaying = (r != 0)
         status = "rate = \(r)"
+    }
+
+    /// Toggle play/pause like the default transport: pause from ANY rate (forward or reverse),
+    /// resume at 1× when paused. Reads the live player rate so it's correct however rate was set.
+    func togglePlayPause() {
+        if player.rate != 0 { setRate(0) } else { setRate(1) }
     }
 
     func loadRemote() {
@@ -218,6 +248,7 @@ struct ProbeView: View {
                 let ds = CMTimeGetSeconds(d)
                 if ds.isFinite, ds > 0 { durationSeconds = ds }
             }
+            isPlaying = (player.rate != 0)   // keep the toggle icon in sync during playback
         }
     }
 
