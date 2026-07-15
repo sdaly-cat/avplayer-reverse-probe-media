@@ -50,6 +50,10 @@ struct ProbeView: View {
     ]
     private var remoteURL: URL { Self.clips[clipIndex].url }
 
+    // Fixed label width for every transport button so they're uniform (sized for the widest, "-10")
+    // and bigger than content-hugging would make them.
+    private let rateButtonWidth: CGFloat = 40
+
     var body: some View {
         VStack(spacing: 10) {
             // Fill all vertical space left over by the compact control cluster below.
@@ -70,22 +74,25 @@ struct ProbeView: View {
                 )
                 Text(timeLabel(durationSeconds)).font(.system(.caption2, design: .monospaced))
             }
-            HStack {
-                ForEach([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0], id: \.self) { r in
+            HStack(spacing: 6) {
+                ForEach([-10.0, -8.0, -6.0, -4.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0], id: \.self) { r in
                     if r == 0 {
                         // Real play/pause toggle: pause from any rate, resume at 1× when paused.
                         Button {
                             togglePlayPause()
                         } label: {
-                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill").frame(width: rateButtonWidth)
                         }
                         .buttonStyle(.bordered)
                     } else {
-                        Button(String(format: "%.1f", r)) { setRate(Float(r)) }
-                            .buttonStyle(.bordered)
+                        Button { setRate(Float(r)) } label: {
+                            Text(rateTitle(r)).frame(width: rateButtonWidth)
+                        }
+                        .buttonStyle(.bordered)
                     }
                 }
             }
+            .controlSize(.large)
             HStack(spacing: 12) {
                 Menu {
                     ForEach(Array(Self.clips.enumerated()), id: \.offset) { idx, clip in
@@ -121,6 +128,11 @@ struct ProbeView: View {
         player.rate = r            // negative = reverse (requires item.canPlayReverse)
         isPlaying = (r != 0)
         status = "rate = \(r)"
+    }
+
+    /// Compact button label: drop the trailing ".0" on whole speeds (so 10 not 10.0) but keep 0.5.
+    func rateTitle(_ r: Double) -> String {
+        r == r.rounded() ? String(format: "%.0f", r) : String(format: "%.1f", r)
     }
 
     /// Toggle play/pause like the default transport: pause from ANY rate (forward or reverse),
@@ -172,6 +184,14 @@ struct ProbeView: View {
                 let d = CMTimeGetSeconds(item.duration)
                 if d.isFinite, d > 0 { durationSeconds = d }   // enable the seek slider immediately
                 Probe.log("\(label) ready — canPlayReverse=\(item.canPlayReverse) slow=\(item.canPlaySlowReverse) fast=\(item.canPlayFastReverse) duration=\(d)")
+                // Auto-seek to the EXACT middle of whatever file is loaded (half its real duration —
+                // no fixed/arbitrary mark). Skipped only if duration is somehow unknown.
+                if d.isFinite, d > 0 {
+                    let mid = d / 2
+                    currentSeconds = mid
+                    seek(to: mid)
+                    Probe.log("auto-seek to middle \(mid)s of \(d)s")
+                }
             } else if item.status == .failed {
                 reverseFlags = "[\(label)] item FAILED: \(item.error?.localizedDescription ?? "?")"
                 Probe.error("\(label) item FAILED: \(describeError(item.error))")
