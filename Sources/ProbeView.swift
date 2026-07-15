@@ -57,7 +57,9 @@ struct ProbeView: View {
     var body: some View {
         VStack(spacing: 10) {
             // Fill all vertical space left over by the compact control cluster below.
-            VideoPlayer(player: player)
+            // Our own controls (seek bar + rate buttons) drive playback, so the default AVKit
+            // transport overlay is suppressed — it was popping up over the video and getting in the way.
+            PlayerSurface(player: player)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             Text(status).font(.footnote)
             Text(reverseFlags).font(.footnote).foregroundColor(.secondary)
@@ -317,6 +319,26 @@ struct ProbeView: View {
         guard seconds.isFinite, seconds >= 0 else { return "--:--" }
         let s = Int(seconds.rounded(.down))
         return String(format: "%d:%02d", s / 60, s % 60)
+    }
+}
+
+/// Hosts the player WITHOUT AVKit's built-in transport controls. SwiftUI's `VideoPlayer` always shows
+/// the tap-to-reveal control overlay and gives no way to disable it, so we wrap `AVPlayerViewController`
+/// directly and set `showsPlaybackControls = false`. The probe's own seek bar + rate buttons are the
+/// only controls. `videoGravity = .resizeAspect` keeps the default fill behavior (letterboxed, no crop).
+struct PlayerSurface: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController()
+        vc.player = player
+        vc.showsPlaybackControls = false
+        vc.videoGravity = .resizeAspect
+        return vc
+    }
+
+    func updateUIViewController(_ vc: AVPlayerViewController, context: Context) {
+        if vc.player !== player { vc.player = player }
     }
 }
 
