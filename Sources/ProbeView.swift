@@ -37,9 +37,30 @@ struct ProbeView: View {
     @State private var clipIndex = 0                    // which entry of `clips` is loaded
     @State private var trickPlay = false                // mode switch: false = native rate, true = seek loop
     @State private var trickTimer: Timer?               // drives trick playback (nil when not trick-playing)
+    @State private var playLocal = false                // source toggle: false = stream, true = downloaded local file
+    @State private var localFiles: [Int: URL] = [:]     // clipIndex -> downloaded local file (once fetched)
+    @State private var isDownloading = false            // a download is in flight (disables the button)
 
     // Thundercloud's FULL_RES_REWIND_RATE — the -0.5 threshold that splits its trick-timer cadence ladder.
     private static let fullResRewindRate = -0.5
+
+    // The on-disk copy of the current clip, if it's been downloaded.
+    private var currentLocalFile: URL? { localFiles[clipIndex] }
+
+    /// Stable on-disk home for downloaded clips. Application Support survives relaunch (unlike
+    /// temporaryDirectory, which iOS may purge) and is the correct place for app-managed files.
+    private static func downloadsDir() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent("clips", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Deterministic path for a clip's local copy, so the same clip always maps to the same file and
+    /// its presence can be detected across relaunches.
+    private static func localPath(for idx: Int) -> URL {
+        downloadsDir().appendingPathComponent("probe-\(idx).mp4")
+    }
 
     // MARK: - Test media (synthetic, hosted on this repo's GitHub Releases)
     // Both are 1920x1080, 59.94fps, H.264 High@4.2, progressive, GOP-30, 12 Mbps CBR, ~180s.
@@ -103,18 +124,35 @@ struct ProbeView: View {
             HStack(spacing: 12) {
                 Menu {
                     ForEach(Array(Self.clips.enumerated()), id: \.offset) { idx, clip in
-                        Button(clip.name) { clipIndex = idx; loadRemote() }
+                        Button(clip.name) { clipIndex = idx; playLocal = false; loadSource(resumeAt: nil) }
                     }
                 } label: {
-                    Label("Stream: \(Self.clips[clipIndex].name)", systemImage: "chevron.down.circle")
+                    Label(Self.clips[clipIndex].name, systemImage: "chevron.down.circle")
                 }
                 .buttonStyle(.borderedProminent)
-                Button("Download then play local") { downloadThenPlay() }.buttonStyle(.bordered)
+                // Download the current clip to disk. Once it's local, the Source toggle can flip to it.
+                Button {
+                    downloadCurrent()
+                } label: {
+                    Label(isDownloading ? "Downloading…" : (currentLocalFile != nil ? "Downloaded" : "Download"),
+                          systemImage: currentLocalFile != nil ? "checkmark.circle.fill" : "arrow.down.circle")
+                }
+                .buttonStyle(.bordered)
+                .disabled(isDownloading || currentLocalFile != nil)   // no pointless re-download
+                // Source: Stream ⟷ Local. Enabled only once the current clip has been downloaded.
+                Toggle("Local", isOn: $playLocal)
+                    .toggleStyle(.switch)
+                    .fixedSize()
+                    .disabled(currentLocalFile == nil)
+                    .help("Off = stream over HTTPS byte-range. On = play the downloaded local file.")
                 Toggle("Trick play", isOn: $trickPlay)
                     .toggleStyle(.switch)
                     .fixedSize()
                     .help("Off = native player.rate. On = Thundercloud-style seek loop for every rate.")
             }
+        }
+        .onChange(of: playLocal) { _ in   // flip source in place, keeping the current playhead for A/B
+            loadSource(resumeAt: currentSeconds)
         }
         .onChange(of: trickPlay) { on in   // single-arg form for iOS 16 (two-arg onChange is iOS 17+)
             // Flipping the mode stops any running loop and parks the player (native rate 0), so the
@@ -138,8 +176,16 @@ struct ProbeView: View {
             forceLandscape()
             probeConnectivity()
             installTimeObserver()
-            loadRemote()
+            restoreDownloads()
+            loadSource(resumeAt: nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { logOrientation() }
+            // Self-drive when launched with -autopilot (passed via `devicectl … launch … -autopilot`,
+            // e.g. `scripts/run-device.sh autopilot`) so the source/rate/mode paths can be validated
+            // from the logs alone, no on-screen taps required.
+            if ProcessInfo.processInfo.arguments.contains("-autopilot") {
+                Probe.log("AUTOPILOT: enabled via launch arg")
+                runAutopilot()
+            }
         }
         .preferredColorScheme(.dark)   // black background; default (black) text flips to light so none of it vanishes
     }
@@ -147,7 +193,16 @@ struct ProbeView: View {
     /// A numbered rate button was pressed. Obeys the mode switch: NATIVE sets `player.rate`; TRICK runs
     /// the Thundercloud seek loop at that rate (forward OR reverse). The play/pause button does NOT go
     /// through here — it's always native (see togglePlayPause).
+    /// Log a transport button press with everything the probe cares about: the rate, the active
+    /// source (streaming vs the downloaded local file), and the playback mode (native vs trick).
+    private func logButtonPress(rate: Float) {
+        let source = (playLocal && currentLocalFile != nil) ? "LOCAL" : "STREAM"
+        let mode = trickPlay ? "TRICK (seek loop)" : "NATIVE (player.rate)"
+        Probe.log("BUTTON → rate=\(rate)  source=\(source)  mode=\(mode)")
+    }
+
     func setRate(_ r: Float) {
+        logButtonPress(rate: r)
         if trickPlay {
             startTrickPlayback(rate: Double(r))
             status = "trick rate = \(r) (seek loop)"
@@ -193,6 +248,57 @@ struct ProbeView: View {
         trickTimer = nil
     }
 
+    // MARK: - Autopilot (self-driving validation, launched with -autopilot)
+    // Drives a deterministic sequence through every source/rate/mode path and logs each transition
+    // with the observed state, so a log read alone confirms behaviour without any on-screen taps.
+    // NOTE: it exercises the LOGIC, not literal touches — a purely visual/layout glitch won't show up.
+
+    /// Log the step (with current observed state) then run its action.
+    private func autopilotStep(_ label: String, _ block: () -> Void) {
+        let observed = String(format: "t=%.2f rate=%.2f trick=%@ local=%@",
+                              currentSeconds, player.rate,
+                              trickTimer != nil ? "on" : "off",
+                              playLocal ? "on" : "off")
+        Probe.log("AUTOPILOT: \(label) [observed \(observed)]")
+        block()
+    }
+
+    /// Schedule an autopilot step `seconds` from now.
+    private func autopilotAfter(_ seconds: Double, _ label: String, _ block: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { autopilotStep(label, block) }
+    }
+
+    /// Poll once a second (up to `triesLeft`) until the current clip is on disk, then continue.
+    private func autopilotAwaitDownload(_ triesLeft: Int, then: @escaping () -> Void) {
+        if currentLocalFile != nil { then(); return }
+        guard triesLeft > 0 else { Probe.error("AUTOPILOT: download did not finish in time"); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            autopilotAwaitDownload(triesLeft - 1, then: then)
+        }
+    }
+
+    func runAutopilot() {
+        Probe.log("AUTOPILOT: begin — clip=\(Self.clips[clipIndex].name)")
+        // Phase 1 — streaming, native rate (forward + reverse).
+        autopilotAfter(3,  "STREAM play forward 1x")      { setRate(1) }
+        autopilotAfter(6,  "STREAM native reverse -0.5x") { setRate(-0.5) }
+        autopilotAfter(9,  "STREAM native reverse -2x")   { setRate(-2) }
+        autopilotAfter(12, "pause + start download")      { setRate(0); downloadCurrent() }
+        // Phase 2 — wait for the download, then LOCAL, then STREAM again, then trick play.
+        autopilotAfter(13, "await download") {
+            autopilotAwaitDownload(120) {
+                Probe.log("AUTOPILOT: download complete → switching to LOCAL")
+                playLocal = true                                                   // onChange → load LOCAL
+                autopilotAfter(2,  "LOCAL native reverse -0.5x")  { setRate(-0.5) }
+                autopilotAfter(5,  "LOCAL pause → back to STREAM") { setRate(0); playLocal = false }
+                autopilotAfter(8,  "STREAM trick play ON")        { trickPlay = true }   // onChange parks rate
+                autopilotAfter(9,  "STREAM trick reverse -0.5x")  { setRate(-0.5) }      // starts seek loop
+                autopilotAfter(12, "pause + trick play OFF")      { setRate(0); trickPlay = false }
+                autopilotAfter(14, "done")                        { Probe.log("AUTOPILOT: complete ✅") }
+            }
+        }
+    }
+
     /// Compact button label: drop the trailing ".0" on whole speeds (so 10 not 10.0) but keep 0.5.
     func rateTitle(_ r: Double) -> String {
         r == r.rounded() ? String(format: "%.0f", r) : String(format: "%.1f", r)
@@ -203,6 +309,7 @@ struct ProbeView: View {
     /// native rate is nonzero OR a trick loop is active.
     func togglePlayPause() {
         let playing = (player.rate != 0) || (trickTimer != nil)
+        logButtonPress(rate: playing ? 0 : 1)   // pausing → 0, resuming → native 1×
         stopTrickPlayback()
         if playing {
             player.rate = 0
@@ -215,43 +322,77 @@ struct ProbeView: View {
         }
     }
 
-    func loadRemote() {
-        // GitHub Releases redirects to objects.githubusercontent.com, which serves the file as
-        // `application/octet-stream` with no `.mp4` in the redirected path — so AVFoundation can't
-        // identify the container and fails with AVErrorFileFormatNotRecognized (-11828). Override the
-        // MIME type so it treats the stream as MP4. (iOS 17+; harmless no-op below that.)
-        var options: [String: Any] = [:]
-        if #available(iOS 17.0, *) {
-            options[AVURLAssetOverrideMIMETypeKey] = "video/mp4"
-        }
+    /// Load the current clip from whichever source the toggle selects: the downloaded local file when
+    /// `playLocal` is on AND a copy exists, otherwise the CDN stream. `resumeAt` seeks back to that
+    /// position once ready (used when flipping the Stream⟷Local toggle so the playhead stays put for
+    /// A/B comparison); pass nil to auto-seek to the middle (fresh load / clip change).
+    func loadSource(resumeAt: Double?) {
         stopTrickPlayback()   // don't let a running loop seek into the newly-loaded item
-        let asset = AVURLAsset(url: remoteURL, options: options)
-        let item = AVPlayerItem(asset: asset)
+        let useLocal = playLocal && currentLocalFile != nil
+        let item: AVPlayerItem
+        let label: String
+        if useLocal, let file = currentLocalFile {
+            item = AVPlayerItem(url: file)
+            label = "LOCAL"
+            status = "playing LOCAL file"
+        } else {
+            // GitHub Releases redirects to objects.githubusercontent.com, which serves the file as
+            // `application/octet-stream` with no `.mp4` in the redirected path — so AVFoundation can't
+            // identify the container and fails with AVErrorFileFormatNotRecognized (-11828). Override the
+            // MIME type so it treats the stream as MP4. (iOS 17+; harmless no-op below that.)
+            var options: [String: Any] = [:]
+            if #available(iOS 17.0, *) {
+                options[AVURLAssetOverrideMIMETypeKey] = "video/mp4"
+            }
+            item = AVPlayerItem(asset: AVURLAsset(url: remoteURL, options: options))
+            label = "STREAM"
+            status = "loading remote (stream)…"
+        }
         player.replaceCurrentItem(with: item)
-        status = "loading remote (stream)…"
-        pollReady(item, label: "STREAM")
+        Probe.log("load \(label) source (resumeAt=\(resumeAt.map { String(format: "%.2f", $0) } ?? "middle"))")
+        pollReady(item, label: label, resumeAt: resumeAt)
     }
 
-    func downloadThenPlay() {
-        status = "downloading…"
-        URLSession.shared.downloadTask(with: remoteURL) { tmp, _, err in
+    /// Re-populate `localFiles` from disk on launch, so downloads persist across relaunches: any clip
+    /// whose deterministic file already exists is marked available (enables its Local toggle).
+    func restoreDownloads() {
+        for idx in Self.clips.indices {
+            let file = Self.localPath(for: idx)
+            if FileManager.default.fileExists(atPath: file.path) {
+                localFiles[idx] = file
+                Probe.log("found existing download for clip \(idx): \(file.lastPathComponent)")
+            }
+        }
+    }
+
+    /// Download the current clip to disk (once), keyed by clipIndex so each clip keeps its own copy.
+    /// Does NOT switch playback — flip the Source toggle to play it. Re-downloads if pressed again.
+    func downloadCurrent() {
+        isDownloading = true
+        let idx = clipIndex
+        let url = remoteURL
+        status = "downloading clip \(idx)…"
+        URLSession.shared.downloadTask(with: url) { tmp, _, err in
             guard let tmp else {
-                DispatchQueue.main.async { status = "download failed: \(err?.localizedDescription ?? "?")" }
+                DispatchQueue.main.async {
+                    isDownloading = false
+                    status = "download failed: \(err?.localizedDescription ?? "?")"
+                }
                 return
             }
-            let dest = FileManager.default.temporaryDirectory.appendingPathComponent("probe.mp4")
+            let dest = Self.localPath(for: idx)
             try? FileManager.default.removeItem(at: dest)
             try? FileManager.default.moveItem(at: tmp, to: dest)
             DispatchQueue.main.async {
-                let item = AVPlayerItem(url: dest)
-                player.replaceCurrentItem(with: item)
-                status = "playing LOCAL file"
-                pollReady(item, label: "LOCAL")
+                localFiles[idx] = dest
+                isDownloading = false
+                status = "downloaded clip \(idx) — flip Local to play it"
+                Probe.log("downloaded clip \(idx) → \(dest.lastPathComponent)")
             }
         }.resume()
     }
 
-    func pollReady(_ item: AVPlayerItem, label: String) {
+    func pollReady(_ item: AVPlayerItem, label: String, resumeAt: Double? = nil) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             if item.status == .readyToPlay {
                 reverseFlags = "[\(label)] canPlayReverse=\(item.canPlayReverse)  slow=\(item.canPlaySlowReverse)  fast=\(item.canPlayFastReverse)"
@@ -259,9 +400,13 @@ struct ProbeView: View {
                 let d = CMTimeGetSeconds(item.duration)
                 if d.isFinite, d > 0 { durationSeconds = d }   // enable the seek slider immediately
                 Probe.log("\(label) ready — canPlayReverse=\(item.canPlayReverse) slow=\(item.canPlaySlowReverse) fast=\(item.canPlayFastReverse) duration=\(d)")
-                // Auto-seek to the EXACT middle of whatever file is loaded (half its real duration —
-                // no fixed/arbitrary mark). Skipped only if duration is somehow unknown.
-                if d.isFinite, d > 0 {
+                // Resume at the requested position (source toggle) or auto-seek to the EXACT middle
+                // of the loaded file (fresh load). Skipped only if duration is somehow unknown.
+                if let r = resumeAt, r.isFinite, r > 0 {
+                    currentSeconds = r
+                    seek(to: r)
+                    Probe.log("resume at \(r)s")
+                } else if d.isFinite, d > 0 {
                     let mid = d / 2
                     currentSeconds = mid
                     seek(to: mid)
@@ -272,7 +417,7 @@ struct ProbeView: View {
                 Probe.error("\(label) item FAILED: \(describeError(item.error))")
                 logMediaLogs(item, label: label)
             } else {
-                pollReady(item, label: label)
+                pollReady(item, label: label, resumeAt: resumeAt)
             }
         }
     }

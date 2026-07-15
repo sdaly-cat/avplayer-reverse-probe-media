@@ -15,7 +15,8 @@
 # that isn't valid here. Auto-provisioning needs a valid Apple ID session in Xcode for that team.
 #
 # USAGE
-#   scripts/run-device.sh          # build (generic iOS) → install → launch, streaming the console
+#   scripts/run-device.sh            # build (generic iOS) → install → launch, streaming the console
+#   scripts/run-device.sh autopilot  # same, but pass -autopilot so the app self-drives a validation run
 #   (config via scripts/device.local.sh; DEVELOPMENT_TEAM / DEV_BUNDLE_ID can also be passed as env)
 #
 # The console streams until the app exits or this process is killed. Run it in the background and read
@@ -73,7 +74,16 @@ echo ">> Installing on device…"
 xcrun devicectl device install app --device "$CTL_ID" "$APP"
 
 # --- 3. Launch with console (streams stdout → our print() lines) -------------
+# Optional first arg `autopilot` appends the -autopilot launch argument (devicectl forwards trailing
+# args to the app's argv, which ProcessInfo.arguments reads).
+# `--` stops devicectl's own option parsing so leading-dash args pass through to the app's argv
+# (otherwise `-autopilot` is misread as a devicectl flag → "Missing value for '-t'").
+LAUNCH_ARGS=()
+if [[ "${1:-}" == "autopilot" ]]; then
+  LAUNCH_ARGS+=("--" "-autopilot")
+  echo ">> AUTOPILOT: passing -autopilot launch arg (app will self-drive a validation run)"
+fi
 echo ">> Launching with console attached (stdout streams below; kill to stop)…"
 : > "$LOGFILE"
 xcrun devicectl device process launch --console --terminate-existing \
-  --device "$CTL_ID" "$BUNDLE_ID" 2>&1 | tee "$LOGFILE"
+  --device "$CTL_ID" "$BUNDLE_ID" ${LAUNCH_ARGS[@]+"${LAUNCH_ARGS[@]}"} 2>&1 | tee "$LOGFILE"
