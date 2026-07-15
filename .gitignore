@@ -10,6 +10,9 @@ xcuserdata/
 # Swift Package Manager
 .build/
 
+# Per-developer device/signing config (personal team id, bundle id, device UDIDs) — never commit
+scripts/device.local.sh
+
 # The .xcodeproj IS committed (so it's clone-and-open), but never its per-user state:
 ReverseProbe.xcodeproj/xcuserdata/
 ReverseProbe.xcodeproj/project.xcworkspace/xcuserdata/

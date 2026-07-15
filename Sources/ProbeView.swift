@@ -3,10 +3,22 @@ import AVKit
 import AVFoundation
 import os
 
-/// Structured log channel for the probe. Filter it from the host with:
-///   xcrun simctl spawn booted log stream --predicate 'subsystem == "com.catapult.ReverseProbe"'
-/// Interpolations are marked `.public` so they are NOT redacted as `<private>`.
-let probeLog = Logger(subsystem: "com.catapult.ReverseProbe", category: "probe")
+/// Structured log channel for the probe. Emits to BOTH:
+///   • os_log (subsystem com.catapult.ReverseProbe) — read on the Simulator via
+///     `xcrun simctl spawn booted log stream --predicate 'subsystem == "com.catapult.ReverseProbe"'`
+///   • stdout via print() — read on a PHYSICAL DEVICE via `devicectl device process launch --console`
+///     (the unified log isn't reachable over the cable with the available tooling, but stdout is).
+enum Probe {
+    private static let logger = Logger(subsystem: "com.catapult.ReverseProbe", category: "probe")
+    static func log(_ msg: String) {
+        logger.log("\(msg, privacy: .public)")
+        print("[probe] \(msg)")
+    }
+    static func error(_ msg: String) {
+        logger.error("\(msg, privacy: .public)")
+        print("[probe][error] \(msg)")
+    }
+}
 
 /// Feasibility probe for native AVPlayer reverse playback while STREAMING over a CDN.
 /// See HANDOFF.md for the full "what is this / what question does it answer" brief.
@@ -90,12 +102,12 @@ struct ProbeView: View {
         .background(
             GeometryReader { proxy in
                 Color.clear.onAppear {
-                    probeLog.log("layout: SwiftUI content size=\(Int(proxy.size.width), privacy: .public)x\(Int(proxy.size.height), privacy: .public)")
+                    Probe.log("layout: SwiftUI content size=\(Int(proxy.size.width))x\(Int(proxy.size.height))")
                 }
             }
         )
         .onAppear {
-            probeLog.log("probe launched — remoteURL=\(remoteURL.absoluteString, privacy: .public)")
+            Probe.log("probe launched — remoteURL=\(remoteURL.absoluteString)")
             forceLandscape()
             probeConnectivity()
             installTimeObserver()
@@ -159,10 +171,10 @@ struct ProbeView: View {
                 status = "\(label) ready — play forward, then try negative rates"
                 let d = CMTimeGetSeconds(item.duration)
                 if d.isFinite, d > 0 { durationSeconds = d }   // enable the seek slider immediately
-                probeLog.log("\(label, privacy: .public) ready — canPlayReverse=\(item.canPlayReverse, privacy: .public) slow=\(item.canPlaySlowReverse, privacy: .public) fast=\(item.canPlayFastReverse, privacy: .public) duration=\(d, privacy: .public)")
+                Probe.log("\(label) ready — canPlayReverse=\(item.canPlayReverse) slow=\(item.canPlaySlowReverse) fast=\(item.canPlayFastReverse) duration=\(d)")
             } else if item.status == .failed {
                 reverseFlags = "[\(label)] item FAILED: \(item.error?.localizedDescription ?? "?")"
-                probeLog.error("\(label, privacy: .public) item FAILED: \(describeError(item.error), privacy: .public)")
+                Probe.error("\(label) item FAILED: \(describeError(item.error))")
                 logMediaLogs(item, label: label)
             } else {
                 pollReady(item, label: label)
@@ -177,7 +189,7 @@ struct ProbeView: View {
     func forceLandscape() {
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape)) { error in
-            probeLog.error("requestGeometryUpdate failed: \(error.localizedDescription, privacy: .public)")
+            Probe.error("requestGeometryUpdate failed: \(error.localizedDescription)")
         }
     }
 
@@ -199,17 +211,17 @@ struct ProbeView: View {
     func logMediaLogs(_ item: AVPlayerItem, label: String) {
         if let el = item.errorLog(), !el.events.isEmpty {
             for e in el.events {
-                probeLog.error("[\(label, privacy: .public)] errorLog status=\(e.errorStatusCode, privacy: .public) domain=\(e.errorDomain, privacy: .public) server=\(e.serverAddress ?? "-", privacy: .public) uri=\(e.uri ?? "-", privacy: .public) comment=\(e.errorComment ?? "-", privacy: .public)")
+                Probe.error("[\(label)] errorLog status=\(e.errorStatusCode) domain=\(e.errorDomain) server=\(e.serverAddress ?? "-") uri=\(e.uri ?? "-") comment=\(e.errorComment ?? "-")")
             }
         } else {
-            probeLog.error("[\(label, privacy: .public)] errorLog: (empty — failure happened before/without an HTTP transaction)")
+            Probe.error("[\(label)] errorLog: (empty — failure happened before/without an HTTP transaction)")
         }
         if let al = item.accessLog(), !al.events.isEmpty {
             for e in al.events {
-                probeLog.log("[\(label, privacy: .public)] accessLog server=\(e.serverAddress ?? "-", privacy: .public) bytes=\(e.numberOfBytesTransferred, privacy: .public) uri=\(e.uri ?? "-", privacy: .public)")
+                Probe.log("[\(label)] accessLog server=\(e.serverAddress ?? "-") bytes=\(e.numberOfBytesTransferred) uri=\(e.uri ?? "-")")
             }
         } else {
-            probeLog.log("[\(label, privacy: .public)] accessLog: (empty — no bytes ever transferred)")
+            Probe.log("[\(label)] accessLog: (empty — no bytes ever transferred)")
         }
     }
 
@@ -220,11 +232,11 @@ struct ProbeView: View {
         req.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
         URLSession.shared.dataTask(with: req) { data, resp, err in
             if let err = err as NSError? {
-                probeLog.error("connectivity: FAILED \(err.domain, privacy: .public)#\(err.code, privacy: .public): \(err.localizedDescription, privacy: .public)")
+                Probe.error("connectivity: FAILED \(err.domain)#\(err.code): \(err.localizedDescription)")
                 return
             }
             let http = resp as? HTTPURLResponse
-            probeLog.log("connectivity: status=\(http?.statusCode ?? -1, privacy: .public) type=\(http?.value(forHTTPHeaderField: "Content-Type") ?? "-", privacy: .public) accept-ranges=\(http?.value(forHTTPHeaderField: "Accept-Ranges") ?? "-", privacy: .public) bytes=\(data?.count ?? 0, privacy: .public)")
+            Probe.log("connectivity: status=\(http?.statusCode ?? -1) type=\(http?.value(forHTTPHeaderField: "Content-Type") ?? "-") accept-ranges=\(http?.value(forHTTPHeaderField: "Accept-Ranges") ?? "-") bytes=\(data?.count ?? 0)")
         }.resume()
     }
 
@@ -233,7 +245,7 @@ struct ProbeView: View {
         let o = scene?.interfaceOrientation.rawValue ?? -1
         let size = scene?.windows.first?.bounds.size ?? .zero
         let isLandscape = scene?.interfaceOrientation.isLandscape ?? false
-        probeLog.log("orientation: interfaceOrientation=\(o, privacy: .public) isLandscape=\(isLandscape, privacy: .public) window=\(Int(size.width), privacy: .public)x\(Int(size.height), privacy: .public)")
+        Probe.log("orientation: interfaceOrientation=\(o) isLandscape=\(isLandscape) window=\(Int(size.width))x\(Int(size.height))")
     }
 
     func installTimeObserver() {
@@ -257,7 +269,7 @@ struct ProbeView: View {
     func seek(to seconds: Double) {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
         player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
-        probeLog.log("seek to \(seconds, privacy: .public)s")
+        Probe.log("seek to \(seconds)s")
     }
 
     /// Live scrub: update the frame continuously WHILE dragging. Uses the "seek chasing" pattern —

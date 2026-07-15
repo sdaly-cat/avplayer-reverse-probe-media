@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Template for scripts/device.local.sh (which is gitignored). Copy it and fill in your own values:
+#   cp scripts/device.local.sh.example scripts/device.local.sh
+# Then edit. run-device.sh sources scripts/device.local.sh if present.
+
+# Apple Developer Team ID — Xcode → target → Signing & Capabilities → Team, or
+# developer.apple.com/account → Membership → Team ID. Looks like: A1B2C3D4E5
+export DEVELOPMENT_TEAM="YOUR_TEAM_ID"
+
+# A PERSONAL, unique bundle id (com.<yourname>.*). Do NOT use the org/team namespace —
+# that routes to the org Apple account and causes signing conflicts.
+export DEV_BUNDLE_ID="com.yourname.reverseprobe"
+
+# Optional: pin the device. If unset, run-device.sh auto-detects the first paired iPad.
+#   DEVICE_CTL_ID  = devicectl identifier  (xcrun devicectl list devices)
+#   DEVICE_DEST_ID = xcodebuild hardware UDID (xcodebuild -showdestinations)
+# export DEVICE_CTL_ID="XXXXXXXX-XXXXXXXXXXXXXXXX"
+# export DEVICE_DEST_ID="00008XXX-XXXXXXXXXXXXXXXX"
