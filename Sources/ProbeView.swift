@@ -35,6 +35,11 @@ struct ProbeView: View {
     @State private var pendingSeekTarget: Double? = nil // latest requested scrub position
     @State private var isPlaying = false                // drives the play/pause toggle icon
     @State private var clipIndex = 0                    // which entry of `clips` is loaded
+    @State private var trickPlay = false                // mode switch: false = native rate, true = seek loop
+    @State private var trickTimer: Timer?               // drives trick playback (nil when not trick-playing)
+
+    // Thundercloud's FULL_RES_REWIND_RATE — the -0.5 threshold that splits its trick-timer cadence ladder.
+    private static let fullResRewindRate = -0.5
 
     // MARK: - Test media (synthetic, hosted on this repo's GitHub Releases)
     // Both are 1920x1080, 59.94fps, H.264 High@4.2, progressive, GOP-30, 12 Mbps CBR, ~180s.
@@ -71,7 +76,7 @@ struct ProbeView: View {
                 SeekBar(
                     current: currentSeconds,
                     duration: durationSeconds,
-                    onScrub: { s in isScrubbing = true; currentSeconds = s; scrubSeek(to: s) },
+                    onScrub: { s in isScrubbing = true; stopTrickPlayback(); isPlaying = false; currentSeconds = s; scrubSeek(to: s) },
                     onCommit: { s in currentSeconds = s; isScrubbing = false; seek(to: s) }
                 )
                 Text(timeLabel(durationSeconds)).font(.system(.caption2, design: .monospaced))
@@ -105,7 +110,20 @@ struct ProbeView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 Button("Download then play local") { downloadThenPlay() }.buttonStyle(.bordered)
+                Toggle("Trick play", isOn: $trickPlay)
+                    .toggleStyle(.switch)
+                    .fixedSize()
+                    .help("Off = native player.rate. On = Thundercloud-style seek loop for every rate.")
             }
+        }
+        .onChange(of: trickPlay) { on in   // single-arg form for iOS 16 (two-arg onChange is iOS 17+)
+            // Flipping the mode stops any running loop and parks the player (native rate 0), so the
+            // next button press starts cleanly in the newly-selected mode.
+            stopTrickPlayback()
+            player.rate = 0
+            isPlaying = false
+            status = on ? "trick play ON (seek loop)" : "trick play OFF (native rate)"
+            Probe.log("mode → \(on ? "TRICK (seek loop)" : "NATIVE rate")")
         }
         .padding()
         .background(
@@ -126,10 +144,53 @@ struct ProbeView: View {
         .preferredColorScheme(.dark)   // black background; default (black) text flips to light so none of it vanishes
     }
 
+    /// A numbered rate button was pressed. Obeys the mode switch: NATIVE sets `player.rate`; TRICK runs
+    /// the Thundercloud seek loop at that rate (forward OR reverse). The play/pause button does NOT go
+    /// through here — it's always native (see togglePlayPause).
     func setRate(_ r: Float) {
-        player.rate = r            // negative = reverse (requires item.canPlayReverse)
+        if trickPlay {
+            startTrickPlayback(rate: Double(r))
+            status = "trick rate = \(r) (seek loop)"
+        } else {
+            stopTrickPlayback()
+            player.rate = r        // negative = reverse (requires item.canPlayReverse)
+            status = "rate = \(r) (native)"
+        }
         isPlaying = (r != 0)
-        status = "rate = \(r)"
+    }
+
+    // MARK: - Trick playback (Thundercloud seek loop)
+    // Native rate is pinned to 0; a repeating timer seeks by (interval × rate) each tick, so the clip
+    // advances/rewinds via discrete seeks instead of the decoder's native (backward) playback. This is
+    // the exact fallback path Thunder Cloud uses for cached/streaming clips (XOSVideoController.m).
+
+    func startTrickPlayback(rate: Double) {
+        stopTrickPlayback()
+        guard rate != 0 else { return }
+        player.rate = 0   // we drive the timeline by seeking, not by native rate
+
+        // Timer cadence ladder, verbatim from Thundercloud's startTrickPlayback:.
+        let interval: TimeInterval =
+            rate > 0                       ? 0.1  :   // forward
+            rate > Self.fullResRewindRate  ? 0.2  :   // slow reverse (−0.5 < rate < 0)
+            rate < Self.fullResRewindRate  ? 0.1  :   // fast reverse (< −0.5)
+                                             0.15     // normal reverse (== −0.5)
+        Probe.log("trick play START rate=\(rate) interval=\(interval)s jump/tick=\(interval * rate)s")
+
+        trickTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
+            let jump = timer.timeInterval * rate                     // seconds to advance this tick
+            let target = CMTimeGetSeconds(player.currentTime()) + jump
+            // Thundercloud's asymmetric tolerance: allow landing slightly in the direction of travel.
+            let tol = CMTime(seconds: 0.1, preferredTimescale: 1000)
+            player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
+                        toleranceBefore: rate < 0 ? tol : .zero,
+                        toleranceAfter:  rate > 0 ? tol : .zero)
+        }
+    }
+
+    func stopTrickPlayback() {
+        trickTimer?.invalidate()
+        trickTimer = nil
     }
 
     /// Compact button label: drop the trailing ".0" on whole speeds (so 10 not 10.0) but keep 0.5.
@@ -137,10 +198,21 @@ struct ProbeView: View {
         r == r.rounded() ? String(format: "%.0f", r) : String(format: "%.1f", r)
     }
 
-    /// Toggle play/pause like the default transport: pause from ANY rate (forward or reverse),
-    /// resume at 1× when paused. Reads the live player rate so it's correct however rate was set.
+    /// Play/pause toggle. ALWAYS native, regardless of the trick-play switch: play resumes at native
+    /// 1× and pause stops everything (including any running trick loop). "Playing" means either the
+    /// native rate is nonzero OR a trick loop is active.
     func togglePlayPause() {
-        if player.rate != 0 { setRate(0) } else { setRate(1) }
+        let playing = (player.rate != 0) || (trickTimer != nil)
+        stopTrickPlayback()
+        if playing {
+            player.rate = 0
+            isPlaying = false
+            status = "paused"
+        } else {
+            player.rate = 1        // native 1× — the play button is the native escape hatch
+            isPlaying = true
+            status = "rate = 1 (native)"
+        }
     }
 
     func loadRemote() {
@@ -152,6 +224,7 @@ struct ProbeView: View {
         if #available(iOS 17.0, *) {
             options[AVURLAssetOverrideMIMETypeKey] = "video/mp4"
         }
+        stopTrickPlayback()   // don't let a running loop seek into the newly-loaded item
         let asset = AVURLAsset(url: remoteURL, options: options)
         let item = AVPlayerItem(asset: asset)
         player.replaceCurrentItem(with: item)
@@ -282,7 +355,7 @@ struct ProbeView: View {
                 let ds = CMTimeGetSeconds(d)
                 if ds.isFinite, ds > 0 { durationSeconds = ds }
             }
-            isPlaying = (player.rate != 0)   // keep the toggle icon in sync during playback
+            isPlaying = (player.rate != 0) || (trickTimer != nil)   // trick loop pins native rate to 0
         }
     }
 
